@@ -1290,15 +1290,29 @@ save_iptables_rules() {
     esac
 }
 
+# Print ss listening sockets, with a timeout so a stuck ss can never
+# freeze the installer: on a system with a huge or wedged socket
+# table ss -p can take minutes, and without the timeout the install
+# would stop after "Checking ports ..." with no further output.
+# Returns 1 when ss is missing, fails or times out.
+ss_listeners() {
+    command -v ss >/dev/null 2>&1 || return 1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 ss -tulnp 2>/dev/null || return 1
+    else
+        ss -tulnp 2>/dev/null || return 1
+    fi
+}
+
 # True (exit 0) if $1 is listened on by a process other than
 # dnstt-server. A listener from our own previous install on 5300
 # must not block a reconfigure.
 port_in_use_by_other() {
-    local port="$1"
-    command -v ss >/dev/null 2>&1 || return 2
+    local port="$1" out
     # ss columns: Netid State Recv-Q Send-Q Local-Address:Port Peer-Address:Port Process
     # so the local address is $5, not $4.
-    ss -tulnp 2>/dev/null | awk -v p="$port" '
+    out=$(ss_listeners) || return 2
+    printf '%s\n' "$out" | awk -v p="$port" '
         NR == 1 { next }
         {
             n = split($5, a, ":")
@@ -1319,9 +1333,9 @@ port_in_use_by_other() {
 
 # Print the ss lines for dnstt processes listening on $1, if any.
 dnstt_listener_line() {
-    local port="$1"
-    command -v ss >/dev/null 2>&1 || return 0
-    ss -tulnp 2>/dev/null | awk -v p="$port" '
+    local port="$1" out
+    out=$(ss_listeners) || return 0
+    printf '%s\n' "$out" | awk -v p="$port" '
         NR == 1 { next }
         {
             n = split($5, a, ":")
@@ -1332,9 +1346,9 @@ dnstt_listener_line() {
 
 # Print the ss lines for non-dnstt processes listening on $1, if any.
 non_dnstt_listener_line() {
-    local port="$1"
-    command -v ss >/dev/null 2>&1 || return 0
-    ss -tulnp 2>/dev/null | awk -v p="$port" '
+    local port="$1" out
+    out=$(ss_listeners) || return 0
+    printf '%s\n' "$out" | awk -v p="$port" '
         NR == 1 { next }
         {
             n = split($5, a, ":")
@@ -1451,6 +1465,14 @@ check_ports_free() {
         print_warning "ss is not available, cannot check whether ports 53 and $DNSTT_PORT are already in use"
         return 0
     fi
+    # One probe up front: if ss itself is stuck (a huge or wedged
+    # socket table can make ss -p take minutes), do not let the
+    # install hang here with no further output; skip the port checks
+    # with a warning instead, as if ss were missing.
+    if ! ss_listeners >/dev/null; then
+        print_warning "Could not list listening sockets (ss failed or timed out), skipping the port check"
+        return 0
+    fi
 
     # Phase 1: dnstt conflicts on either port first. Port 53 is
     # often also held by another service (e.g. systemd-resolved),
@@ -1473,11 +1495,16 @@ check_ports_free() {
             handle_dnstt_conflict "$port" "$listener" || exit 1
         fi
     done
+    print_status "No conflicting dnstt service found"
     # Phase 2: any other listener on either port fails the install.
     local rc
     for port in 53 "$DNSTT_PORT"; do
-        port_in_use_by_other "$port"
-        rc=$?
+        # NB: port_in_use_by_other returns 1 when the port is free,
+        # which is the normal case. Under the script's set -e a bare
+        # call would kill the installer silently right here, so the
+        # || captures the status instead of letting it exit.
+        rc=0
+        port_in_use_by_other "$port" || rc=$?
         if [ "$rc" -eq 0 ]; then
             print_error "Port $port is already in use by another process"
             non_dnstt_listener_line "$port" || true
