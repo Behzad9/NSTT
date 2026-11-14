@@ -24,7 +24,7 @@ DNSTT_BASE_URL="https://dnstt.network"
 # The script itself must be downloaded from the raw URL below, and the
 # file must first be pushed to this repo as dnstt-deploy-fixed.sh on main.
 # Until then the raw URL returns 404 and the self-update must refuse it.
-SCRIPT_URL="https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy-fixed.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/dnstt"
 SYSTEMD_DIR="/etc/systemd/system"
