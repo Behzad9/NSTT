@@ -60,7 +60,7 @@ NSTT نسخه امن‌تر و اصلاح‌شده [bugfloyd/dnstt-deploy](https
 
 **نصب با یک دستور:**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy-fixed.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh)
 ```
 
 این دستور:
@@ -263,7 +263,7 @@ dnstt-deploy
 
 **روش ۲: اجرای دوباره دستور curl**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy-fixed.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh)
 # اسکریپت به‌صورت خودکار به‌روزرسانی را تشخیص می‌دهد و نصب می‌کند
 ```
 
