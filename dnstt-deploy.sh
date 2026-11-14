@@ -1304,6 +1304,12 @@ port_in_use_by_other() {
             n = split($5, a, ":")
             if (n > 0 && a[n] == p) {
                 if ($0 ~ /dnstt-server/) next
+                # Port 53 is only used for the iptables redirect on
+                # the external interface, so a listener on loopback
+                # only (e.g. systemd-resolved on 127.0.0.53 or
+                # 127.0.0.54) never receives external DNS traffic
+                # and does not block the tunnel.
+                if (p == 53 && ($5 ~ /^127\./ || $5 ~ /^\[::1\]/)) next
                 found = 1
             }
         }
@@ -1332,16 +1338,22 @@ non_dnstt_listener_line() {
         NR == 1 { next }
         {
             n = split($5, a, ":")
-            if (n > 0 && a[n] == p && tolower($0) !~ /dnstt/) print
+            if (n > 0 && a[n] == p && tolower($0) !~ /dnstt/) {
+                # Same loopback exception as port_in_use_by_other:
+                # a loopback-only listener on port 53 does not block
+                # the tunnel.
+                if (p == 53 && ($5 ~ /^127\./ || $5 ~ /^\[::1\]/)) next
+                print
+            }
         }
     '
 }
 
 # True if our own dnstt-server systemd service is currently active.
-# Only then is a dnstt listener on DNSTT_PORT our own install being
-# reconfigured, rather than another dnstt that must be removed.
-# (Our service never listens on port 53, so this is only used for
-# DNSTT_PORT.)
+# Together with RECONFIGURE_MODE=1 this marks a dnstt listener on
+# DNSTT_PORT as our own install being reconfigured, rather than
+# another dnstt that must be removed. (Our service never listens on
+# port 53, so this is only used for DNSTT_PORT.)
 is_own_dnstt_active() {
     [ -f "${SYSTEMD_DIR}/dnstt-server.service" ] \
         && command -v systemctl >/dev/null 2>&1 \
@@ -1444,9 +1456,10 @@ check_ports_free() {
         listener=$(dnstt_listener_line "$port" || true)
         if [ -n "$listener" ]; then
             # Our own active service on DNSTT_PORT is a reconfigure,
-            # not a conflict. A dnstt listener on port 53 is never
-            # our service, so it is always a conflict.
-            if [ "$port" = "$DNSTT_PORT" ] && is_own_dnstt_active; then
+            # not a conflict, but only when reconfiguring from the
+            # menu (RECONFIGURE_MODE=1). A dnstt listener on port 53
+            # is never our service, so it is always a conflict.
+            if [ "$port" = "$DNSTT_PORT" ] && [ "${RECONFIGURE_MODE:-0}" = "1" ] && is_own_dnstt_active; then
                 print_status "Port $port is used by our own running dnstt-server (reconfiguring it)"
                 continue
             fi
@@ -1460,8 +1473,8 @@ check_ports_free() {
         rc=$?
         if [ "$rc" -eq 0 ]; then
             print_error "Port $port is already in use by another process"
-            ss -tulnp 2>/dev/null | grep -E ":$port[[:space:]]" || true
-            print_error "Stop or reconfigure that service first (often systemd-resolved on 127.0.0.53:53)"
+            non_dnstt_listener_line "$port" || true
+            print_error "Stop or reconfigure that service first, then run the install again"
             exit 1
         elif [ "$rc" -eq 2 ]; then
             print_warning "Could not check port $port (ss failed), continuing"
@@ -2009,6 +2022,12 @@ main() {
     local cli_mode=""
     NONINTERACTIVE=0
     CLI_YES=0
+    # 1 only when the user chose menu option 1 (Install/Reconfigure):
+    # then our own active service is a reconfigure, not a conflict.
+    # A fresh install (one-command or --install) leaves it 0, so a
+    # running dnstt, even our own previous install, is offered for
+    # complete removal instead of being silently kept.
+    RECONFIGURE_MODE=0
     CLI_SUBDOMAIN="" CLI_MTU="" CLI_MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2083,12 +2102,14 @@ main() {
         check_for_updates
         handle_menu
         # If we reach here, user chose option 1 (Install/Reconfigure), so continue
+        RECONFIGURE_MODE=1
         print_status "Starting dnstt server installation/reconfiguration..."
     fi
 
     # Fail fast if another service already owns port 53 or 5300,
     # before asking the user for input or changing anything.
-    # Our own previous dnstt-server listener on 5300 is exempt.
+    # Our own previous dnstt-server listener on 5300 is exempt only
+    # when reconfiguring from the menu (RECONFIGURE_MODE=1).
     check_ports_free
 
     # Get user input
