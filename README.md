@@ -1,4 +1,4 @@
-# NSTT
+# ِDNSTT
 
 **Languages:** [English](README.md) | [فارسی](README-fa.md)
 
@@ -60,7 +60,7 @@ Go into your name registrar's configuration panel and add these records:
 
 **One-command installation:**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy-fixed.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh)
 ```
 
 This command will:
@@ -263,7 +263,7 @@ dnstt-deploy
 
 **Method 2: Re-run the curl command**
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy-fixed.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh)
 # The script will detect and install updates automatically
 ```
 
