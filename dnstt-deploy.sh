@@ -1360,6 +1360,14 @@ is_own_dnstt_active() {
         && systemctl is-active --quiet dnstt-server 2>/dev/null
 }
 
+# Read one line and return 0 when it is YES in any letter case
+# (yes, Yes, yEs and YES all confirm; anything else declines).
+confirm_yes() {
+    local answer
+    read -r answer
+    [ "$(printf '%s' "$answer" | tr '[:lower:]' '[:upper:]')" = "YES" ]
+}
+
 # A dnstt process other than our own active service is using $1.
 # Warn the user, and if they confirm, remove that dnstt completely
 # and then make sure the port is really free before the install
@@ -1398,10 +1406,8 @@ handle_dnstt_conflict() {
         fi
     else
         echo ""
-        print_question "Type YES to remove it completely and continue with the installation (anything else cancels): "
-        local confirm
-        read -r confirm
-        if [ "$confirm" != "YES" ]; then
+        print_question "Type YES to remove it completely and continue with the installation (any letter case, anything else cancels): "
+        if ! confirm_yes; then
             print_error "Installation cancelled, the running dnstt was left untouched"
             return 1
         fi
@@ -1431,6 +1437,7 @@ handle_dnstt_conflict() {
         return 1
     fi
     print_status "Conflicting dnstt removed, port $port is free now"
+    DNSTT_REMOVED=1
     return 0
 }
 
@@ -1482,6 +1489,24 @@ check_ports_free() {
     done
 
     print_status "Ports 53 and $DNSTT_PORT are free"
+}
+
+# After a conflicting dnstt was removed, restart the installer from
+# the top so the install runs on the now-clean system instead of
+# continuing mid-flow with state from before the removal. Only once:
+# DNSTT_REINVOKED guards against a loop if a dnstt keeps coming back
+# after removal. The original arguments are passed along, so a
+# --install run keeps its flags and an interactive run prompts again.
+maybe_reinvoke_after_removal() {
+    if [ "${DNSTT_REMOVED:-0}" != "1" ]; then
+        return 0
+    fi
+    if [ "${DNSTT_REINVOKED:-0}" = "1" ]; then
+        print_status "A conflicting dnstt was already removed once, continuing without another restart"
+        return 0
+    fi
+    print_status "Conflicting dnstt removed, restarting the installation..."
+    DNSTT_REINVOKED=1 exec "$SCRIPT_INSTALL_PATH" --reinvoke-install "$@"
 }
 
 # Function to configure firewall
@@ -1944,10 +1969,8 @@ uninstall_dnstt() {
 
     print_uninstall_summary with-script
     echo ""
-    print_question "Type YES to confirm complete removal (anything else cancels): "
-    local confirm
-    read -r confirm
-    if [ "$confirm" != "YES" ]; then
+    print_question "Type YES to confirm complete removal (any letter case, anything else cancels): "
+    if ! confirm_yes; then
         print_status "Uninstall cancelled, nothing was removed"
         return 0
     fi
@@ -2020,6 +2043,10 @@ main() {
     # Flags only apply with --install; without it the menu flow is
     # unchanged and any flags are ignored.
     local cli_mode=""
+    # Original arguments, saved before the parse loop below consumes
+    # them with shift, so a restart after a conflict removal can
+    # re-invoke the installer with the same arguments.
+    local ORIGINAL_ARGS=("$@")
     NONINTERACTIVE=0
     CLI_YES=0
     # 1 only when the user chose menu option 1 (Install/Reconfigure):
@@ -2028,10 +2055,18 @@ main() {
     # running dnstt, even our own previous install, is offered for
     # complete removal instead of being silently kept.
     RECONFIGURE_MODE=0
+    # Set to 1 by handle_dnstt_conflict when it removes a dnstt,
+    # so main can restart the installer once afterwards.
+    DNSTT_REMOVED=0
     CLI_SUBDOMAIN="" CLI_MTU="" CLI_MODE=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --install) cli_mode="install"; NONINTERACTIVE=1; shift ;;
+            # Internal only: restart after a conflict removal, with
+            # the original arguments. Like --install, but it does not
+            # force NONINTERACTIVE, so values missing from the flags
+            # are still prompted for.
+            --reinvoke-install) cli_mode="install"; shift ;;
             --status) cli_mode="status"; shift ;;
             --update) cli_mode="update"; shift ;;
             --check-update) cli_mode="check-update"; shift ;;
@@ -2111,6 +2146,10 @@ main() {
     # Our own previous dnstt-server listener on 5300 is exempt only
     # when reconfiguring from the menu (RECONFIGURE_MODE=1).
     check_ports_free
+
+    # If a conflicting dnstt was removed above, restart the
+    # installer from the top on the now-clean system.
+    maybe_reinvoke_after_removal "${ORIGINAL_ARGS[@]}"
 
     # Get user input
     get_user_input
