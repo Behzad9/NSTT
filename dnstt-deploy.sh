@@ -5,6 +5,38 @@
 
 set -e
 
+SCRIPT_VERSION="1.1.0"
+
+# Usage text is defined before the root check so that --help and
+# --version work for any user, without needing root or tools.
+print_usage() {
+    cat <<'EOF'
+Usage: dnstt-deploy [--install --subdomain DOMAIN --mode socks|ssh [--mtu N] [--yes]]
+       dnstt-deploy [--status | --update | --check-update]
+       dnstt-deploy [--help | --version]
+
+With no arguments, shows the interactive menu.
+
+Options:
+  --install                 Install/reconfigure without prompts. Requires
+                            --subdomain and --mode; --mtu defaults to 1232
+                            (or the stored value, when reconfiguring).
+  --subdomain DOMAIN        Nameserver subdomain, e.g. t.example.com
+  --mtu N                   MTU, a number between 576 and 9000
+  --mode socks|ssh         Tunnel mode (also accepts 1 for socks, 2 for ssh)
+  --yes                     Confirm prompts in scripted use, including
+                            removing a conflicting dnstt service
+  --status                  Show service status and configuration, then exit
+  --update                  Update this script from SCRIPT_URL, then exit
+  --check-update            Only check whether a newer script is available
+  --help, -h                Show this help
+  --version                 Show the script version
+EOF
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then print_usage; exit 0; fi
+if [ "${1:-}" = "--version" ]; then echo "dnstt-deploy $SCRIPT_VERSION"; exit 0; fi
+
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
     echo -e "\033[0;31m[ERROR]\033[0m This script must be run as root"
@@ -22,7 +54,7 @@ NC='\033[0m' # No Color
 DNSTT_BASE_URL="https://dnstt.network"
 # NOTE: https://github.com/Behzad9/NSTT is only the repo page (HTML).
 # The script itself must be downloaded from the raw URL below, and the
-# file must first be pushed to this repo as dnstt-deploy-fixed.sh on main.
+# file must first be pushed to this repo as dnstt-deploy.sh on main.
 # Until then the raw URL returns 404 and the self-update must refuse it.
 SCRIPT_URL="https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-deploy.sh"
 INSTALL_DIR="/usr/local/bin"
@@ -40,6 +72,34 @@ DANTE_CONF="/etc/danted.conf"
 # Global variable to track if update is available
 UPDATE_AVAILABLE=false
 
+# How this script was invoked, resolved to a real path.
+# $0 alone is not reliable: it is the full path when run via PATH or by
+# absolute path, but it is "dnstt-deploy" for `bash dnstt-deploy` and
+# "./dnstt-deploy" for `./dnstt-deploy` (verified: the first two resolve
+# to the installed path, the last two do not). An exact $0 comparison
+# therefore misdetects an installed script as a fresh download: main()
+# would reinstall from GitHub and skip the menu, and check_for_updates()
+# would silently skip the update check. Resolve once, here.
+resolve_invoked_path() {
+    local p="$1" resolved=""
+    if [[ "$p" == */* ]]; then
+        resolved="$(readlink -f -- "$p" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then printf '%s\n' "$resolved"; else printf '%s\n' "$p"; fi
+    else
+        resolved="$(command -v -- "$p" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then printf '%s\n' "$resolved"; else printf '%s\n' "$p"; fi
+    fi
+}
+SCRIPT_SELF="$(resolve_invoked_path "$0")"
+
+# True when this process is the installed script, however it was invoked.
+is_installed_invocation() {
+    local installed=""
+    installed="$(readlink -f -- "$SCRIPT_INSTALL_PATH" 2>/dev/null || true)"
+    [ -n "$installed" ] || installed="$SCRIPT_INSTALL_PATH"
+    [ "$SCRIPT_SELF" = "$installed" ]
+}
+
 # Function to install/update the script itself
 install_script() {
     # Defensive check: main() now runs check_required_tools() first,
@@ -51,8 +111,10 @@ install_script() {
 
     print_status "Installing/updating dnstt-deploy script..."
 
-    # Download the latest version
-    local temp_script="/tmp/dnstt-deploy-new.sh"
+    # Download the latest version into a unique temp file, never a
+    # fixed /tmp name that another run or user could pre-create.
+    local temp_script
+    temp_script="$(mktemp /tmp/dnstt-deploy-new.XXXXXX)"
     if ! curl -fsSL "$SCRIPT_URL" -o "$temp_script"; then
         print_error "Failed to download latest version from $SCRIPT_URL"
         rm -f "$temp_script"
@@ -101,7 +163,8 @@ install_script() {
 update_script() {
     print_status "Checking for script updates..."
 
-    local temp_script="/tmp/dnstt-deploy-latest.sh"
+    local temp_script
+    temp_script="$(mktemp /tmp/dnstt-deploy-latest.XXXXXX)"
     if ! curl -fsSL "$SCRIPT_URL" -o "$temp_script"; then
         print_error "Failed to download latest version"
         rm -f "$temp_script"
@@ -154,9 +217,10 @@ show_menu() {
     echo "3) Check service status"
     echo "4) View service logs"
     echo "5) Show configuration info"
+    echo "6) Uninstall dnstt server"
     echo "0) Exit"
     echo ""
-    print_question "Please select an option (0-5): "
+    print_question "Please select an option (0-6): "
 }
 
 # Function to handle menu selection
@@ -191,12 +255,15 @@ handle_menu() {
             5)
                 show_configuration_info
                 ;;
+            6)
+                uninstall_dnstt
+                ;;
             0)
                 print_status "Goodbye!"
                 exit 0
                 ;;
             *)
-                print_error "Invalid choice. Please enter 0-5."
+                print_error "Invalid choice. Please enter 0-6."
                 ;;
         esac
 
@@ -274,11 +341,14 @@ show_configuration_info() {
     echo ""
 }
 check_for_updates() {
-    # Only check for updates if we're running from the installed location
-    if [ "$0" = "$SCRIPT_INSTALL_PATH" ]; then
+    # Only check for updates if we're running from the installed location.
+    # Compare resolved paths, not $0: `bash dnstt-deploy` and
+    # `./dnstt-deploy` leave $0 as a bare or relative name.
+    if is_installed_invocation; then
         print_status "Checking for script updates..."
 
-        local temp_script="/tmp/dnstt-deploy-latest.sh"
+        local temp_script
+        temp_script="$(mktemp /tmp/dnstt-deploy-latest.XXXXXX)"
         if curl -fsSL "$SCRIPT_URL" -o "$temp_script" 2>/dev/null && [ -s "$temp_script" ] && head -n 1 "$temp_script" | grep -q '^#!/bin/bash'; then
             local current_checksum
             local latest_checksum
@@ -718,6 +788,10 @@ install_dependencies() {
 
 # Function to get user input
 get_user_input() {
+    # CLI flags (only set by --install) must survive load_existing_config,
+    # which resets NS_SUBDOMAIN/MTU_VALUE/TUNNEL_MODE from the stored file.
+    local cli_domain="$NS_SUBDOMAIN" cli_mtu="$MTU_VALUE" cli_mode="$TUNNEL_MODE"
+
     # Load existing configuration if available
     local existing_domain=""
     local existing_mtu=""
@@ -733,6 +807,40 @@ get_user_input() {
             existing_mode=""
         fi
         print_status "Found existing configuration for domain: $existing_domain"
+    fi
+
+    # Non-interactive install: flags win, then the stored config, then
+    # the MTU default. Prompts are skipped, and a missing or invalid
+    # value is a hard error instead of a question that can never be
+    # answered. Under set -e, return 1 here stops the install.
+    if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+        [ -n "$cli_domain" ] && NS_SUBDOMAIN="$cli_domain"
+        [ -n "$NS_SUBDOMAIN" ] || NS_SUBDOMAIN="$existing_domain"
+        [ -n "$cli_mtu" ] && MTU_VALUE="$cli_mtu"
+        [ -n "$MTU_VALUE" ] || MTU_VALUE="${existing_mtu:-1232}"
+        [ -n "$cli_mode" ] && TUNNEL_MODE="$cli_mode"
+        [ -n "$TUNNEL_MODE" ] || TUNNEL_MODE="$existing_mode"
+        case "$TUNNEL_MODE" in
+            1) TUNNEL_MODE="socks" ;;
+            2) TUNNEL_MODE="ssh" ;;
+        esac
+        if [ -z "$NS_SUBDOMAIN" ] || ! is_valid_subdomain "$NS_SUBDOMAIN"; then
+            print_error "--install needs a valid --subdomain (e.g. t.example.com)"
+            return 1
+        fi
+        if ! is_valid_mtu "$MTU_VALUE"; then
+            print_error "--install needs a valid --mtu between 576 and 9000"
+            return 1
+        fi
+        if [ "$TUNNEL_MODE" != "socks" ] && [ "$TUNNEL_MODE" != "ssh" ]; then
+            print_error "--install needs --mode socks or --mode ssh"
+            return 1
+        fi
+        print_status "Configuration:"
+        print_status "  Nameserver subdomain: $NS_SUBDOMAIN"
+        print_status "  MTU: $MTU_VALUE"
+        print_status "  Tunnel mode: $TUNNEL_MODE"
+        return 0
     fi
 
     # Get nameserver subdomain
@@ -1203,6 +1311,92 @@ port_in_use_by_other() {
     '
 }
 
+# Print the ss lines for dnstt processes listening on $1, if any.
+dnstt_listener_line() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -tulnp 2>/dev/null | awk -v p="$port" '
+        NR == 1 { next }
+        {
+            n = split($5, a, ":")
+            if (n > 0 && a[n] == p && tolower($0) ~ /dnstt/) print
+        }
+    '
+}
+
+# True if our own dnstt-server systemd service is currently active.
+# Only then is a dnstt listener on DNSTT_PORT our own install being
+# reconfigured, rather than another dnstt that must be removed.
+# (Our service never listens on port 53, so this is only used for
+# DNSTT_PORT.)
+is_own_dnstt_active() {
+    [ -f "${SYSTEMD_DIR}/dnstt-server.service" ] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet dnstt-server 2>/dev/null
+}
+
+# A dnstt process other than our own active service is using $1.
+# Warn the user, and if they confirm, remove that dnstt completely
+# and then make sure the port is really free before the install
+# continues. Returns 0 when the port is free afterwards, 1 when the
+# user declines or the port stays busy.
+handle_dnstt_conflict() {
+    local port="$1" listener="$2"
+    print_warning "Another dnstt service is already running and using port $port:"
+    echo "  $listener"
+    print_warning "It must be completely removed before this install can continue."
+    # Load the old config only to describe what the removal deletes
+    # (tunnel mode, Dante). Restore the install's own values right
+    # after, so a --install run keeps its CLI flags.
+    local saved_subdomain="${NS_SUBDOMAIN:-}" saved_mtu="${MTU_VALUE:-}" saved_mode="${TUNNEL_MODE:-}"
+    load_existing_config || true
+    print_uninstall_summary without-script
+    NS_SUBDOMAIN="$saved_subdomain"; MTU_VALUE="$saved_mtu"; TUNNEL_MODE="$saved_mode"
+    if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+        if [ "${CLI_YES:-0}" = "1" ]; then
+            print_status "Non-interactive mode with --yes: removing the conflicting dnstt..."
+        else
+            print_error "Run the install interactively to confirm the removal, or re-run with --install --yes to allow it"
+            return 1
+        fi
+    else
+        echo ""
+        print_question "Type YES to remove it completely and continue with the installation (anything else cancels): "
+        local confirm
+        read -r confirm
+        if [ "$confirm" != "YES" ]; then
+            print_error "Installation cancelled, the running dnstt was left untouched"
+            return 1
+        fi
+    fi
+
+    remove_dnstt_install
+
+    # The managed install is gone, but a manually started dnstt
+    # process may still hold the port. Stop it by PID if it does.
+    local remaining pid wait_attempt
+    remaining=$(dnstt_listener_line "$port" || true)
+    if [ -n "$remaining" ]; then
+        pid=$(printf '%s' "$remaining" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+        if [ -n "$pid" ]; then
+            print_status "Stopping the remaining dnstt process (PID $pid)..."
+            kill "$pid" 2>/dev/null || true
+            for wait_attempt in 1 2 3 4 5; do
+                if [ -z "$(dnstt_listener_line "$port" || true)" ]; then
+                    break
+                fi
+                sleep 1
+            done
+        fi
+    fi
+    if [ -n "$(dnstt_listener_line "$port" || true)" ]; then
+        print_error "Port $port is still in use by a dnstt process after removal; stop it manually and run the install again"
+        return 1
+    fi
+    print_status "Conflicting dnstt removed, port $port is free now"
+    return 0
+}
+
 # Fail fast if port 53 (DNS) or DNSTT_PORT is already owned by
 # another service, e.g. systemd-resolved on 127.0.0.53:53, dnsmasq
 # or BIND. Without this the tunnel silently never receives queries.
@@ -1214,8 +1408,20 @@ check_ports_free() {
         return 0
     fi
 
-    local port rc
+    local port rc listener
     for port in 53 "$DNSTT_PORT"; do
+        listener=$(dnstt_listener_line "$port" || true)
+        if [ -n "$listener" ]; then
+            # Our own active service on DNSTT_PORT is a reconfigure,
+            # not a conflict. A dnstt listener on port 53 is never
+            # our service, so it is always a conflict.
+            if [ "$port" = "$DNSTT_PORT" ] && is_own_dnstt_active; then
+                print_status "Port $port is used by our own running dnstt-server (reconfiguring it)"
+                continue
+            fi
+            handle_dnstt_conflict "$port" "$listener" || exit 1
+            continue
+        fi
         port_in_use_by_other "$port"
         rc=$?
         if [ "$rc" -eq 0 ]; then
@@ -1345,7 +1551,7 @@ setup_dante() {
     # Debian/Ubuntu use /etc/danted.conf + danted, RHEL/Fedora use
     # /etc/sockd.conf + sockd; see set_dante_names())
     cat > "$DANTE_CONF" << EOF
-# Dante SOCKS server configuration
+# Dante SOCKS server configuration - managed by dnstt-deploy (NSTT)
 logoutput: syslog
 user.privileged: root
 user.unprivileged: nobody
@@ -1488,6 +1694,229 @@ EOF
     print_status "Mode: $TUNNEL_MODE"
 }
 
+# Detect the primary network interface, using the same method as
+# configure_iptables(). Returns an empty string if none is found.
+detect_primary_interface() {
+    local iface=""
+    if command -v ip >/dev/null 2>&1; then
+        iface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
+        if [ -z "$iface" ]; then
+            iface=$(ip link show 2>/dev/null | grep -E "^[0-9]+: (eth|ens|enp)" | head -1 | cut -d':' -f2 | awk '{print $1}')
+        fi
+        if [ -z "$iface" ] && ip link show eth0 >/dev/null 2>&1; then
+            iface="eth0"
+        fi
+    fi
+    printf '%s' "$iface"
+}
+
+# Delete every copy of one iptables/ip6tables rule, if it exists.
+# $1 = iptables or ip6tables, $2 = table, remaining args = rule.
+remove_iptables_rule() {
+    local cmd="$1" table="$2"
+    shift 2
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+    local guard=0
+    while [ "$guard" -lt 20 ]; do
+        if ! "$cmd" -t "$table" -C "$@" 2>/dev/null; then
+            return 0
+        fi
+        if ! "$cmd" -t "$table" -D "$@" 2>/dev/null; then
+            print_warning "Could not remove $cmd ($table) rule: $*"
+            return 0
+        fi
+        guard=$((guard + 1))
+    done
+    print_warning "Stopped removing $cmd ($table) rule after 20 copies"
+}
+
+# True if the Dante config file was written by this script.
+is_dante_managed() {
+    [ -f "$DANTE_CONF" ] && head -n 5 "$DANTE_CONF" 2>/dev/null | grep -q "Dante SOCKS server configuration"
+}
+
+# Print what a complete removal deletes. $1 = with-script: also list
+# this script itself (menu uninstall); without-script: do not list
+# it (install-time removal, where the script must keep running).
+print_uninstall_summary() {
+    echo ""
+    print_warning "This will permanently remove:"
+    echo "  - dnstt-server systemd service (stop, disable, delete the unit file)"
+    echo "  - Configuration directory $CONFIG_DIR, including private and public keys"
+    echo "  - Binary ${INSTALL_DIR}/dnstt-server"
+    echo "  - iptables rules for UDP $DNSTT_PORT and the port 53 redirect (IPv4 and IPv6)"
+    echo "  - firewalld/ufw rules for ports 53/udp and $DNSTT_PORT/udp, if present"
+    if [ "${TUNNEL_MODE:-}" = "socks" ] || is_dante_managed; then
+        echo "  - Dante SOCKS service ($DANTE_SERVICE) and its config $DANTE_CONF"
+    fi
+    if [ "$1" = "with-script" ]; then
+        echo "  - This script itself ($SCRIPT_INSTALL_PATH)"
+    fi
+    echo "  - The dante-server package is NOT removed."
+    echo ""
+    print_warning "Private keys cannot be recovered. After a reinstall with the same subdomain, clients will need the new public key."
+}
+
+# Completely remove a dnstt install: service, Dante (only if this
+# install used it), iptables/firewall rules, keys and config, and
+# the binary. This is the core used by both the menu uninstall and
+# the install-time conflict removal. It never deletes this script
+# itself and never exits, so the caller can continue afterwards.
+# The dante-server package is left installed on purpose, so a
+# Dante used for something else is not broken by removing its
+# package. Returns 0 on completion; individual failures only warn.
+remove_dnstt_install() {
+    local service_file="${SYSTEMD_DIR}/dnstt-server.service"
+    local binary_file="${INSTALL_DIR}/dnstt-server"
+
+    # 1. Stop and disable dnstt-server.
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet dnstt-server 2>/dev/null; then
+            print_status "Stopping dnstt-server..."
+            systemctl stop dnstt-server || print_warning "Could not stop dnstt-server"
+        fi
+        if systemctl is-enabled --quiet dnstt-server 2>/dev/null; then
+            systemctl disable dnstt-server || print_warning "Could not disable dnstt-server"
+        fi
+    fi
+
+    # 2. Stop and disable Dante, but only if this install used it.
+    # The config file is removed only if this script wrote it; a
+    # Dante config written by someone else is left alone.
+    local remove_dante=false
+    if [ "${TUNNEL_MODE:-}" = "socks" ]; then
+        remove_dante=true
+    elif is_dante_managed; then
+        remove_dante=true
+    fi
+    if [ "$remove_dante" = true ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemctl is-active --quiet "$DANTE_SERVICE" 2>/dev/null; then
+                print_status "Stopping $DANTE_SERVICE..."
+                systemctl stop "$DANTE_SERVICE" || print_warning "Could not stop $DANTE_SERVICE"
+            fi
+            if systemctl is-enabled --quiet "$DANTE_SERVICE" 2>/dev/null; then
+                systemctl disable "$DANTE_SERVICE" || print_warning "Could not disable $DANTE_SERVICE"
+            fi
+        fi
+        if [ -f "$DANTE_CONF" ]; then
+            if is_dante_managed; then
+                rm -f "$DANTE_CONF" && print_status "Removed Dante config $DANTE_CONF"
+            else
+                print_warning "Dante config $DANTE_CONF was not created by this script, leaving it"
+            fi
+        fi
+    else
+        print_status "Dante was not used by this install, leaving it alone"
+    fi
+
+    # 3. Remove the systemd unit file.
+    if [ -f "$service_file" ]; then
+        rm -f "$service_file" && print_status "Removed $service_file"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || print_warning "Could not reload systemd"
+        systemctl reset-failed dnstt-server 2>/dev/null || true
+    fi
+
+    # 4. Remove the iptables rules added at install time. The NAT
+    # rule was added for a specific interface, so detect it the
+    # same way as configure_iptables() did.
+    if command -v iptables >/dev/null 2>&1; then
+        print_status "Removing iptables rules..."
+        remove_iptables_rule iptables filter INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
+        local iface
+        iface=$(detect_primary_interface || true)
+        if [ -n "$iface" ]; then
+            remove_iptables_rule iptables nat PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+        else
+            print_warning "Could not detect network interface, the NAT redirect rule may remain; check with: iptables -t nat -L PREROUTING -n --line-numbers"
+        fi
+        if command -v ip6tables >/dev/null 2>&1; then
+            remove_iptables_rule ip6tables filter INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
+            if [ -n "$iface" ]; then
+                remove_iptables_rule ip6tables nat PREROUTING -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports "$DNSTT_PORT"
+            fi
+        fi
+        # Persist the removal, so the rules do not come back on reboot.
+        # save_iptables_rules() backs up the previous saved file first.
+        save_iptables_rules || print_warning "Could not save iptables rules, removal may not persist after reboot"
+    else
+        print_warning "iptables is not available, skipping iptables cleanup"
+    fi
+
+    # 5. Remove firewalld and ufw rules, if those services are active.
+    if command -v firewall-cmd >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        local fw_port removed_fw=false
+        for fw_port in "$DNSTT_PORT"/udp 53/udp; do
+            if firewall-cmd --permanent --query-port="$fw_port" >/dev/null 2>&1; then
+                if firewall-cmd --permanent --remove-port="$fw_port" >/dev/null 2>&1; then
+                    removed_fw=true
+                else
+                    print_warning "Could not remove firewalld port $fw_port"
+                fi
+            fi
+        done
+        if [ "$removed_fw" = true ]; then
+            firewall-cmd --reload >/dev/null 2>&1 || print_warning "Could not reload firewalld"
+            print_status "Removed firewalld ports"
+        fi
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        local ufw_port
+        for ufw_port in "$DNSTT_PORT"/udp 53/udp; do
+            if ufw status 2>/dev/null | grep -q "$ufw_port"; then
+                ufw --force delete allow "$ufw_port" >/dev/null 2>&1 || print_warning "Could not remove ufw rule for $ufw_port"
+            fi
+        done
+    fi
+
+    # 6. Remove the binary and the whole configuration directory.
+    if [ -f "$binary_file" ]; then
+        rm -f "$binary_file" && print_status "Removed $binary_file"
+    fi
+    if [ -n "$CONFIG_DIR" ] && [ "$CONFIG_DIR" != "/" ] && [ "$CONFIG_DIR" != "/etc" ] && [ -d "$CONFIG_DIR" ]; then
+        rm -rf "$CONFIG_DIR" && print_status "Removed $CONFIG_DIR (including private keys)"
+    fi
+
+    print_status "Uninstall complete"
+    return 0
+}
+
+# Menu uninstall: confirm, remove everything, then delete this
+# script itself and exit.
+uninstall_dnstt() {
+    print_status "Uninstall dnstt server"
+    print_status "====================="
+
+    # Load the config if there is one, only to know the tunnel mode
+    # and subdomain for the summary. A missing config is not fatal.
+    load_existing_config || true
+
+    print_uninstall_summary with-script
+    echo ""
+    print_question "Type YES to confirm complete removal (anything else cancels): "
+    local confirm
+    read -r confirm
+    if [ "$confirm" != "YES" ]; then
+        print_status "Uninstall cancelled, nothing was removed"
+        return 0
+    fi
+
+    remove_dnstt_install
+
+    # Remove this script itself. Deleting it while bash is still
+    # reading it can fail, so defer the deletion to the EXIT trap:
+    # it runs after this script has finished executing.
+    if [ -n "$SCRIPT_INSTALL_PATH" ] && [ "$SCRIPT_INSTALL_PATH" != "/" ] && [ -f "$SCRIPT_INSTALL_PATH" ]; then
+        print_status "Removing $SCRIPT_INSTALL_PATH"
+        trap 'rm -f "$SCRIPT_INSTALL_PATH" || true' EXIT
+    fi
+    exit 0
+}
+
 # Function to start services
 start_services() {
     print_status "Starting services..."
@@ -1539,16 +1968,79 @@ display_final_info() {
 
 # Main function
 main() {
-    # Tools first: detect_os sets PKG_MANAGER, check_required_tools
-    # installs curl, ip, ss and iptables if missing. install_script
-    # and check_for_updates both need curl and sha256sum, so they
-    # must run only after this point, not before it.
+    # Parse arguments first, before any tool installation, so a typo or
+    # --help/--version fails fast without touching the system.
+    # Flags only apply with --install; without it the menu flow is
+    # unchanged and any flags are ignored.
+    local cli_mode=""
+    NONINTERACTIVE=0
+    CLI_YES=0
+    CLI_SUBDOMAIN="" CLI_MTU="" CLI_MODE=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --install) cli_mode="install"; NONINTERACTIVE=1; shift ;;
+            --status) cli_mode="status"; shift ;;
+            --update) cli_mode="update"; shift ;;
+            --check-update) cli_mode="check-update"; shift ;;
+            --subdomain)
+                if [ $# -lt 2 ]; then print_error "--subdomain needs a value"; print_usage; exit 2; fi
+                CLI_SUBDOMAIN="$2"; shift 2 ;;
+            --subdomain=*) CLI_SUBDOMAIN="${1#--subdomain=}"; shift ;;
+            --mtu)
+                if [ $# -lt 2 ]; then print_error "--mtu needs a value"; print_usage; exit 2; fi
+                CLI_MTU="$2"; shift 2 ;;
+            --mtu=*) CLI_MTU="${1#--mtu=}"; shift ;;
+            --mode)
+                if [ $# -lt 2 ]; then print_error "--mode needs a value"; print_usage; exit 2; fi
+                CLI_MODE="$2"; shift 2 ;;
+            --mode=*) CLI_MODE="${1#--mode=}"; shift ;;
+            --yes) CLI_YES=1; shift ;;  # confirm prompts in scripted use, including removing a conflicting dnstt
+            -h|--help) print_usage; exit 0 ;;
+            --version) echo "dnstt-deploy $SCRIPT_VERSION"; exit 0 ;;
+            *) print_error "Unknown option: $1"; print_usage; exit 2 ;;
+        esac
+    done
+
+    # Tools: detect_os sets PKG_MANAGER, check_required_tools installs
+    # curl, ip, ss and iptables if missing. install_script and
+    # check_for_updates both need curl and sha256sum, so they must run
+    # only after this point, not before it.
     detect_os
     detect_arch
     check_required_tools
 
+    # Single-purpose modes exit here and never touch the install flow.
+    if [ "$cli_mode" = "status" ]; then
+        if show_configuration_info; then exit 0; else exit 1; fi
+    fi
+    if [ "$cli_mode" = "update" ]; then
+        if update_script; then exit 0; else exit 1; fi
+    fi
+    if [ "$cli_mode" = "check-update" ]; then
+        check_for_updates
+        if [ "$UPDATE_AVAILABLE" = true ]; then
+            print_warning "A newer version is available; run with --update or menu option 2."
+        else
+            print_status "Script is up to date (or the update check did not apply)."
+        fi
+        exit 0
+    fi
+
+    if [ "$cli_mode" = "install" ]; then
+        # Non-interactive install: no menu, no prompts. Values come from
+        # flags (or the stored config) in get_user_input.
+        NS_SUBDOMAIN="$CLI_SUBDOMAIN"
+        MTU_VALUE="$CLI_MTU"
+        TUNNEL_MODE="$CLI_MODE"
+        if ! is_installed_invocation; then
+            print_status "Installing dnstt-deploy script..."
+            install_script
+            print_status "Starting dnstt server setup..."
+        else
+            print_status "Starting dnstt server installation/reconfiguration..."
+        fi
     # If not running from installed location (curl/GitHub), install the script first
-    if [ "$0" != "$SCRIPT_INSTALL_PATH" ]; then
+    elif ! is_installed_invocation; then
         print_status "Installing dnstt-deploy script..."
         install_script
         print_status "Starting dnstt server setup..."
