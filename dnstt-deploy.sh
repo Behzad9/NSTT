@@ -1324,6 +1324,19 @@ dnstt_listener_line() {
     '
 }
 
+# Print the ss lines for non-dnstt processes listening on $1, if any.
+non_dnstt_listener_line() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -tulnp 2>/dev/null | awk -v p="$port" '
+        NR == 1 { next }
+        {
+            n = split($5, a, ":")
+            if (n > 0 && a[n] == p && tolower($0) !~ /dnstt/) print
+        }
+    '
+}
+
 # True if our own dnstt-server systemd service is currently active.
 # Only then is a dnstt listener on DNSTT_PORT our own install being
 # reconfigured, rather than another dnstt that must be removed.
@@ -1352,6 +1365,18 @@ handle_dnstt_conflict() {
     load_existing_config || true
     print_uninstall_summary without-script
     NS_SUBDOMAIN="$saved_subdomain"; MTU_VALUE="$saved_mtu"; TUNNEL_MODE="$saved_mode"
+    # If another service that is not dnstt also holds a port, say so
+    # now: removing dnstt will not free that port, and the install
+    # will still stop until that service is stopped or reconfigured.
+    local other_port other
+    for other_port in 53 "$DNSTT_PORT"; do
+        other=$(non_dnstt_listener_line "$other_port" || true)
+        if [ -n "$other" ]; then
+            print_warning "Note: port $other_port is also used by another service (not dnstt):"
+            echo "  $other"
+            print_warning "Removing dnstt will not free that port; the install will still stop until that service is stopped or reconfigured."
+        fi
+    done
     if [ "${NONINTERACTIVE:-0}" = "1" ]; then
         if [ "${CLI_YES:-0}" = "1" ]; then
             print_status "Non-interactive mode with --yes: removing the conflicting dnstt..."
@@ -1408,7 +1433,13 @@ check_ports_free() {
         return 0
     fi
 
-    local port rc listener
+    # Phase 1: dnstt conflicts on either port first. Port 53 is
+    # often also held by another service (e.g. systemd-resolved),
+    # and checking it first used to abort the install before the
+    # dnstt on DNSTT_PORT was ever looked at, so the removal was
+    # never offered. Check both ports for dnstt before failing on
+    # any other service.
+    local port listener
     for port in 53 "$DNSTT_PORT"; do
         listener=$(dnstt_listener_line "$port" || true)
         if [ -n "$listener" ]; then
@@ -1420,8 +1451,11 @@ check_ports_free() {
                 continue
             fi
             handle_dnstt_conflict "$port" "$listener" || exit 1
-            continue
         fi
+    done
+    # Phase 2: any other listener on either port fails the install.
+    local rc
+    for port in 53 "$DNSTT_PORT"; do
         port_in_use_by_other "$port"
         rc=$?
         if [ "$rc" -eq 0 ]; then
