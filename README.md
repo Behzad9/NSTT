@@ -1,4 +1,4 @@
-# ِDNSTT
+# NSTT
 
 **Languages:** [English](README.md) | [فارسی](README-fa.md)
 
@@ -7,7 +7,7 @@
 
 A comprehensive automation script for deploying and managing [dnstt](https://www.bamsoftware.com/software/dnstt) DNS tunnel servers on Linux systems. This script handles everything from installation to configuration, making DNS tunnel deployment effortless.
 
-NSTT is a hardened version of [bugfloyd/dnstt-deploy](https://github.com/bugfloyd/dnstt-deploy), with input validation, safe configuration handling, idempotent firewall rules, per-distribution Dante support, a port-conflict check, and binary verification on every run.
+NSTT is a hardened version of [bugfloyd/dnstt-deploy](https://github.com/bugfloyd/dnstt-deploy), with input validation, safe configuration handling, idempotent firewall rules, per-distribution Dante support, a port-conflict check, binary verification on every run, a safe uninstall option, and a non-interactive install mode for automation.
 
 ## DNS Domain Setup
 
@@ -43,9 +43,10 @@ Go into your name registrar's configuration panel and add these records:
 - **Input validation**: The subdomain must be a valid DNS name and the MTU must be a number between 576 and 9000
 - **Flexible tunneling**: SSH mode or SOCKS proxy mode
 - **Network ready**: Automatic firewall and iptables configuration; rules are added only once, and saved rules are backed up before being overwritten
-- **Port-conflict check**: The setup stops early if port 53 or 5300 is already owned by another service (for example systemd-resolved), instead of silently never receiving queries
+- **Port-conflict check**: The setup stops early if port 53 or 5300 is already owned by another service (for example systemd-resolved), instead of silently never receiving queries. If the listener is another dnstt service, the installer warns you and, only after you type `YES` (any letter case), removes that dnstt completely and then continues with the installation
 - **Binary verification**: MD5, SHA1, and SHA256 checksum validation on every run, including for an already installed binary; a mismatched or corrupted binary is re-downloaded
 - **Per-distribution Dante**: `danted` on Debian/Ubuntu and `sockd` on Fedora/Rocky/CentOS, with the matching configuration file and service checks
+- **Safe uninstall**: menu option 6 completely removes the dnstt install (service, keys, iptables and firewall rules, binary, and the script itself) after a typed `YES` confirmation, and only removes Dante when this install used it
 - **Official binaries**: Downloads from [dnstt.network](https://dnstt.network)
 
 ## Quick Start
@@ -85,6 +86,7 @@ This will show an interactive menu with these options:
 3. **Check service status** - View current service status
 4. **View service logs** - Monitor real-time logs (Ctrl+C to exit)
 5. **Show configuration info** - Show the current configuration, public key, and management commands
+6. **Uninstall dnstt server** - Completely remove the dnstt install (asks for confirmation first)
 0. **Exit** - Quit the menu
 
 ### Setup Process
@@ -198,6 +200,22 @@ This provides quick access to:
 - Service status monitoring
 - Real-time log viewing
 - Configuration info
+- Safe uninstall (option 6)
+
+### Command-Line Usage
+
+For scripts and automation, the same operations are available without the menu:
+
+```bash
+dnstt-deploy --install --subdomain t.example.com --mode socks --mtu 1232
+dnstt-deploy --status
+dnstt-deploy --update
+dnstt-deploy --check-update
+dnstt-deploy --help
+dnstt-deploy --version
+```
+
+`--install` needs `--subdomain` and `--mode socks|ssh` (`--mtu` defaults to 1232, or to the stored value when reconfiguring). A missing or invalid value stops the install with an error instead of asking. Uninstall stays interactive: run `dnstt-deploy` and choose option 6, then type `YES` (any letter case) to confirm.
 
 ### File Locations
 
@@ -267,6 +285,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Behzad9/NSTT/main/dnstt-depl
 # The script will detect and install updates automatically
 ```
 
+### Uninstalling
+
+To completely remove a dnstt install, run `dnstt-deploy` and choose option 6 (Uninstall dnstt server). The script shows exactly what will be removed and asks you to type `YES` (any letter case) to confirm; anything else cancels and nothing is removed.
+
+The uninstall removes:
+- The `dnstt-server` systemd service (stop, disable, delete the unit file)
+- The Dante SOCKS service and its config, but only if this install used SOCKS mode; a Dante config written by someone else is left alone
+- The iptables rules for UDP 5300 and the port 53 redirect (IPv4 and IPv6), and the saved rules are updated so they do not come back on reboot
+- The firewalld/ufw rules for ports 53/udp and 5300/udp, if present
+- The configuration directory `/etc/dnstt`, including private and public keys (private keys cannot be recovered, so clients will need the new public key after a reinstall)
+- The `dnstt-server` binary and the `dnstt-deploy` script itself
+
+The `dante-server` package itself is not removed.
+
+
+
 ## Troubleshooting
 
 ### Using the Built-in Tools
@@ -307,7 +341,9 @@ If the setup stops with "Port 53 is already in use" or "Port 5300 is already in 
 ```bash
 sudo ss -tulnp | grep -E ":(53|5300)[[:space:]]"
 ```
-On many systems the culprit on port 53 is systemd-resolved listening on `127.0.0.53:53`. Stop or reconfigure that service first, then run the setup again. A listener from your own previous dnstt-server install on port 5300 does not block a reconfigure.
+On many systems the listener on port 53 is systemd-resolved on `127.0.0.53:53` or `127.0.0.54:53`, but a loopback-only listener like that does not block the install, because the port 53 redirect only applies to the external interface. Only a listener on `0.0.0.0:53` or a public address blocks it; stop or reconfigure that service first, then run the setup again. A listener from your own previous dnstt-server install on port 5300 does not block a reconfigure (menu option 1); a fresh install offers to remove it instead, see below.
+
+**Another dnstt is already running**: if the process using port 53 or 5300 is a dnstt service other than your own active one, the installer shows the listener, explains that it must be completely removed, and asks you to type `YES` (any letter case) to remove it and continue. Anything else cancels the installation and leaves the running dnstt untouched. A running dnstt is offered for removal during a fresh install (the one-command install or `--install`), even if it is your own previous install. Only menu option 1 (Install/Reconfigure) treats your own active dnstt-server as a reconfigure, not a conflict. The installer checks both ports for a dnstt service before failing on any other service, so a dnstt on port 5300 is still offered for removal even when another service also holds port 53; in that case it warns you that removing dnstt will not free port 53, and the install will still stop until that service is stopped or reconfigured. A listener on port 53 that only listens on loopback (for example systemd-resolved on 127.0.0.53 or 127.0.0.54) does not block the install, because the port 53 redirect only applies to the external interface; a listener on 0.0.0.0:53 or a public address still blocks it. In non-interactive mode (`--install`), the removal only happens with `--yes`; without it the install stops with an error. After the removal, the installer restarts itself once from the top, so the installation runs on the clean system; if a dnstt is still running after the restart, it is handled without another restart. The port check itself never hangs: listing sockets is capped at 10 seconds, and if `ss` fails or times out the check is skipped with a warning instead of stopping the install.
 
 **Binary Verification Failed**:
 If the setup reports a checksum mismatch, the downloaded binary was not installed and the previously installed binary was left untouched. Check your network connection and try again; do not install a binary from an untrusted source.
